@@ -112,7 +112,7 @@ export const generateSpec = schemaTask({
     const context = buildContext(payload.nodes, payload.edges, payload.chatHistory)
 
     const result = await generateText({
-      model: google("gemini-2.5-flash"),
+      model: google(process.env.GEMINI_SPEC_MODEL ?? "gemini-3.1-flash-lite"),
       system: SYSTEM_PROMPT,
       prompt: context,
     })

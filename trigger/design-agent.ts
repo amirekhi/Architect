@@ -193,7 +193,7 @@ export const designAgent = task({
       }
 
       const result = await generateText({
-        model: google("gemini-2.5-flash"),
+        model: google(process.env.GEMINI_MODEL ?? "gemini-3.1-flash-lite"),
         system: buildSystemPrompt(),
         prompt: `User request: ${payload.prompt}\n\n${canvasContext}`,
         tools: canvasTools,
