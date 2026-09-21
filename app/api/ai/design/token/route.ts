@@ -17,9 +17,10 @@ export async function POST(request: Request) {
     return Response.json({ error: "Not found" }, { status: 404 })
   }
 
-  const token = await triggerAuth.createPublicToken({
-    scopes: { read: { runs: [runId] } },
-  })
+const token = await triggerAuth.createPublicToken({
+  scopes: { read: { runs: [runId] } },
+  expirationTime: "1h",
+})
 
   return Response.json({ token })
 }
