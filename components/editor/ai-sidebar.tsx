@@ -80,6 +80,18 @@ function RunTracker({ runId, publicToken, onTerminal }: RunTrackerProps) {
     onTerminal(run.status, run.output)
   }, [run?.status, run?.id, onTerminal])
 
+  // Safety net: if the realtime subscription never delivers a terminal
+  // status (dropped socket, expired token, etc.), stop waiting after 90s
+  // and tell the UI to unblock rather than hang forever.
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      if (firedRef.current) return
+      firedRef.current = true
+      onTerminal("TIMED_OUT", undefined)
+    }, 90_000)
+    return () => clearTimeout(timeout)
+  }, [onTerminal])
+
   return null
 }
 
@@ -580,8 +592,18 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
         {/* AI Architect Tab */}
         <TabsContent value="architect" className="min-h-0 flex-1 overflow-hidden">
           <div className="flex h-full flex-col">
-            <ScrollArea className="flex-1" ref={scrollRef as React.Ref<HTMLDivElement>}>
-              <div className="px-4 pt-3 pb-2">
+            {/*
+              FIX: swapped ScrollArea for a plain overflow-y-auto div.
+              ScrollArea (Radix) needs a well-behaved bounded-height ancestor
+              chain to compute its scroll thumb; when that chain breaks (e.g.
+              inside nested flex columns like this sidebar), it can silently
+              just grow instead of scrolling. A plain div with min-h-0 +
+              overflow-y-auto is guaranteed browser behavior — min-h-0
+              overrides the flex-item default of "don't shrink below content
+              size", which is what was defeating the scroll in the first place.
+            */}
+              <div ref={scrollRef} className="custom-scrollbar min-h-0 flex-1 overflow-y-auto">
+              <div className="px-5 py-4">
                 {validatedChatMessages.length === 0 ? (
                   <div className="flex flex-col items-center gap-5 py-8 text-center">
                     <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-ai/15">
@@ -591,7 +613,7 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
                       <p className="text-sm font-medium text-text-primary">
                         Ghost AI Architect
                       </p>
-                      <p className="mt-1 text-xs leading-5 text-text-muted">
+                      <p className="mt-1 p-2 text-xs leading-5 text-text-muted">
                         Describe your system and I&apos;ll design the architecture on the canvas.
                       </p>
                     </div>
@@ -615,14 +637,16 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
                           <div className="mt-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-accent-ai/15">
                             <Bot className="h-3 w-3 text-accent-ai-text" />
                           </div>
-                          <div className="max-w-[85%] rounded-2xl rounded-bl-sm border border-border-subtle bg-bg-elevated px-4 py-2.5 text-sm text-accent-ai-text">
+                          {/* FIX: py-2.5 -> py-3 for a touch more breathing room */}
+                          <div className="max-w-[85%] rounded-2xl rounded-bl-sm border border-border-subtle bg-bg-elevated px-4 py-3 text-sm text-accent-ai-text">
                             {msg.content}
                           </div>
                         </div>
                       ) : (
                         <div key={msg.id} className="flex justify-end">
+                          {/* FIX: py-2.5 -> py-3 for a touch more breathing room */}
                           <div
-                            className="max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2.5 text-sm font-medium text-white"
+                            className="max-w-[85%] rounded-2xl rounded-br-sm px-4 py-3 text-sm font-medium text-white"
                             style={{ backgroundColor: "#62C073" }}
                           >
                             {msg.content}
@@ -633,7 +657,7 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
                   </div>
                 )}
               </div>
-            </ScrollArea>
+            </div>
 
             {/* Status strip — only visible while a run is active */}
             {isLoading && activeStatusText && (
@@ -685,8 +709,10 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
         {/* Chat Tab */}
         <TabsContent value="chat" className="min-h-0 flex-1 overflow-hidden">
           <div className="flex h-full flex-col">
-            <ScrollArea className="flex-1" ref={chatScrollRef as React.Ref<HTMLDivElement>}>
-              <div className="px-4 pt-3 pb-2">
+            {/* Same ScrollArea -> div fix as the Architect tab above */}
+            <div ref={chatScrollRef} className="custom-scrollbar min-h-0 flex-1 overflow-y-auto">
+
+              <div className="px-5 py-4">
                 {validatedChatMessages.length === 0 ? (
                   <div className="flex flex-col items-center gap-4 py-8 text-center">
                     <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-bg-subtle">
@@ -724,9 +750,10 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
                             </span>
                             <span>{formatTime(msg.createdAt)}</span>
                           </div>
+                          {/* FIX: py-2 -> py-2.5 for a touch more breathing room */}
                           <div
                             className={cn(
-                              "max-w-[85%] rounded-2xl px-3 py-2 text-xs text-text-primary",
+                              "max-w-[85%] rounded-2xl px-3 py-2.5 text-xs text-text-primary",
                               isMe
                                 ? "rounded-br-sm font-medium text-white"
                                 : isAI
@@ -743,7 +770,7 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
                   </div>
                 )}
               </div>
-            </ScrollArea>
+            </div>
 
             {/* Error state */}
             {chatError && (
@@ -782,7 +809,7 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
         </TabsContent>
 
         {/* Specs Tab */}
-        <TabsContent value="specs" className="min-h-0 flex-1 overflow-hidden">
+        <TabsContent value="specs" className="custom-scrollbar min-h-0 flex-1 overflow-y-auto">
           <div className="flex h-full flex-col gap-3 p-4">
             <Button
               onClick={handleGenerateSpec}
@@ -809,7 +836,7 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
                 <p className="text-xs text-text-muted">No specs yet. Generate one above.</p>
               </div>
             ) : (
-              <ScrollArea className="flex-1">
+              <div className="min-h-0 flex-1 overflow-y-auto">
                 <div className="flex flex-col gap-2 pr-1">
                   {specs.map((spec) => (
                     <div
@@ -840,7 +867,7 @@ export function AiSidebar({ isOpen, onClose, roomId, projectId }: AiSidebarProps
                     </div>
                   ))}
                 </div>
-              </ScrollArea>
+              </div>
             )}
           </div>
         </TabsContent>

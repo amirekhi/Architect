@@ -153,12 +153,49 @@ const canvasTools = {
 type ToolName = keyof typeof canvasTools;
 type ToolCall = { toolName: ToolName; input: Record<string, unknown> };
 
+// NEW: turns a single tool call into a short, human-readable status line.
+// This is what viewers will see updating live in the sidebar as the agent works.
+function describeAction(call: ToolCall): string {
+  switch (call.toolName) {
+    case "addNode": {
+      const { label } = call.input as { label?: string };
+      return `Adding "${label || "node"}"…`;
+    }
+    case "addEdge": {
+      const { source, target } = call.input as { source: string; target: string };
+      return `Connecting ${source} → ${target}…`;
+    }
+    case "moveNode": {
+      const { id } = call.input as { id: string };
+      return `Repositioning "${id}"…`;
+    }
+    case "resizeNode": {
+      const { id } = call.input as { id: string };
+      return `Resizing "${id}"…`;
+    }
+    case "updateNodeData": {
+      const { id } = call.input as { id: string };
+      return `Updating "${id}"…`;
+    }
+    case "deleteNode": {
+      const { id } = call.input as { id: string };
+      return `Removing "${id}"…`;
+    }
+    case "deleteEdge":
+      return "Removing a connection…";
+    default:
+      return "Working…";
+  }
+}
+
 export const designAgent = task({
   id: "design-agent",
   retry: { maxAttempts: 2 },
   run: async (payload: { prompt: string; roomId: string; userId: string }) => {
     const lb = getLiveblocks();
-    const google = createGoogleGenerativeAI({ apiKey: process.env.GOOGLE_AI_API_KEY });
+    const google = createGoogleGenerativeAI({
+      apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+    });
 
     await lb
       .setPresence(payload.roomId, {
@@ -192,39 +229,49 @@ export const designAgent = task({
         // No storage yet — treat as empty
       }
 
+      // NEW: these get filled in live, as each step finishes, instead of
+      // being computed once from result.steps after generateText resolves.
+      let appliedCount = 0;
+      let summary = "Design applied to canvas.";
+
       const result = await generateText({
         model: google(process.env.GEMINI_MODEL ?? "gemini-3.1-flash-lite"),
         system: buildSystemPrompt(),
         prompt: `User request: ${payload.prompt}\n\n${canvasContext}`,
         tools: canvasTools,
         toolChoice: "required",
-      });
+        // NEW: this is the core of the change. The AI SDK awaits this callback
+        // after each step of tool-calling before letting the model continue —
+        // so applying the mutation here means Liveblocks (and every connected
+        // browser) sees the node/edge the instant the model decides on it,
+        // not after the whole response is done.
+        onStepFinish: async (step) => {
+          const calls = (step.toolCalls ?? []) as ToolCall[];
 
-      const toolCalls = result.steps.flatMap((s) => s.toolCalls) as ToolCall[];
-      const actionCalls = toolCalls.filter((c) => c.toolName !== "finalizeDesign");
-      const finalizeCall = toolCalls.find((c) => c.toolName === "finalizeDesign");
-      const summary =
-        (finalizeCall?.input as { summary?: string } | undefined)?.summary ??
-        "Design applied to canvas.";
+          for (const call of calls) {
+            if (call.toolName === "finalizeDesign") {
+              summary =
+                (call.input as { summary?: string } | undefined)?.summary ?? summary;
+              continue;
+            }
 
-      const addCount = actionCalls.filter((c) => c.toolName === "addNode").length;
-      await lb
-        .broadcastEvent(payload.roomId, {
-          type: "ai-status",
-          message: `Placing ${addCount} node${addCount !== 1 ? "s" : ""} on the canvas…`,
-          status: "thinking",
-        })
-        .catch(() => {});
+            await lb.mutateStorage(payload.roomId, ({ root }) => {
+              const flow = root.get("flow");
+              if (!flow) return;
+              applyToolCall(call, flow.get("nodes"), flow.get("edges"));
+            });
 
-      await lb.mutateStorage(payload.roomId, ({ root }) => {
-        const flow = root.get("flow");
-        if (!flow) return;
-        const nodes = flow.get("nodes");
-        const edges = flow.get("edges");
+            appliedCount += 1;
 
-        for (const call of actionCalls) {
-          applyToolCall(call, nodes, edges);
-        }
+            await lb
+              .broadcastEvent(payload.roomId, {
+                type: "ai-status",
+                message: describeAction(call),
+                status: "thinking",
+              })
+              .catch(() => {});
+          }
+        },
       });
 
       await lb
@@ -235,7 +282,7 @@ export const designAgent = task({
         })
         .catch(() => {});
 
-      return { success: true, actionsApplied: actionCalls.length, summary };
+      return { success: true, actionsApplied: appliedCount, summary };
     } catch (error) {
       await lb
         .broadcastEvent(payload.roomId, {
