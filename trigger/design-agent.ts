@@ -484,29 +484,71 @@ export const designAgent = task({
       .catch(() => {});
 
     try {
+      // Single read of the canvas, taken once before generation starts.
+      // This seeds BOTH the prompt context AND the in-memory node/edge
+      // maps the settle pass uses later — the settle pass never reads
+      // storage again after this. That's deliberate: earlier versions
+      // re-read storage via a second getStorageDocument() call *after*
+      // this run's own mutateStorage() writes had already applied, and
+      // relied on that read reflecting all of them. Liveblocks storage
+      // reads aren't guaranteed to reflect a burst of very recent writes
+      // from the same task the instant they're requested back — if even
+      // one just-added node was missing from that second read, the
+      // settle pass would silently lay everything out with no knowledge
+      // that node existed, and could relocate other nodes right on top
+      // of it. Tracking state in memory as we make each write removes
+      // that race entirely: we always know exactly what we wrote,
+      // because we wrote it.
+      const liveNodes = new Map<string, Rect>();
+      const liveEdges = new Map<string, SimpleEdge>();
+
       let canvasContext = "The canvas is currently empty — create a fresh design.";
       try {
         const doc = await lb.getStorageDocument(payload.roomId, "json");
         const flow = (doc as Record<string, unknown>)?.flow as
-          | Record<string, unknown>
+          | {
+              nodes?: Record<
+                string,
+                { position?: { x: number; y: number }; width?: number; height?: number }
+              >;
+              edges?: Record<string, { id: string; source: string; target: string }>;
+            }
           | undefined;
-        const nodeCount = flow?.nodes ? Object.keys(flow.nodes as object).length : 0;
-        if (nodeCount > 0) {
-          canvasContext = `Canvas has ${nodeCount} existing node(s). Current state:\n${JSON.stringify(flow, null, 2)}\nExtend or modify based on the request; only clear if explicitly asked.`;
+
+        for (const [id, nd] of Object.entries(flow?.nodes ?? {})) {
+          if (!nd?.position) continue;
+          liveNodes.set(id, {
+            x: nd.position.x,
+            y: nd.position.y,
+            width: nd.width ?? SHAPE_DEFAULTS.rectangle.width,
+            height: nd.height ?? SHAPE_DEFAULTS.rectangle.height,
+          });
+        }
+        for (const edge of Object.values(flow?.edges ?? {})) {
+          if (edge?.source && edge?.target) {
+            liveEdges.set(edge.id, { id: edge.id, source: edge.source, target: edge.target });
+          }
+        }
+
+        if (liveNodes.size > 0) {
+          canvasContext = `Canvas has ${liveNodes.size} existing node(s). Current state:\n${JSON.stringify(
+            { nodes: Object.fromEntries(liveNodes), edges: Object.fromEntries(liveEdges) },
+            null,
+            2
+          )}\nExtend or modify based on the request; only clear if explicitly asked.`;
         }
       } catch {
-        // No storage yet — treat as empty
+        // No storage yet — treat as empty. liveNodes/liveEdges stay empty,
+        // which correctly represents a fresh canvas.
       }
 
       let appliedCount = 0;
       let summary = "Design applied to canvas.";
 
-      // Only tracks WHICH node ids this run touched (added, moved,
-      // resized, relabeled/recolored). Their actual positions/sizes are
-      // read straight from storage after all tool calls are applied —
-      // see the settle pass below — rather than tracked by hand here,
-      // which removes a whole class of bugs where our own bookkeeping
-      // could drift from what was actually written to storage.
+      // Tracks WHICH node ids this run touched (added, moved, resized,
+      // relabeled/recolored) — these are the ones the settle pass is
+      // allowed to move. Their positions/sizes live in liveNodes above,
+      // kept in sync with every mutateStorage() call below as it happens.
       const touchedNodeIds = new Set<string>();
 
       const result = await generateText({
@@ -525,18 +567,72 @@ export const designAgent = task({
               continue;
             }
 
+            // Mirror this call's effect onto liveNodes/liveEdges in
+            // lockstep with the actual storage mutation below, so the
+            // settle pass later has an exact, race-free picture.
             switch (call.toolName) {
-              case "addNode":
-              case "moveNode":
-              case "resizeNode":
+              case "addNode": {
+                const { id, shape, x, y } = call.input as {
+                  id: string;
+                  shape: NodeShape;
+                  x: number;
+                  y: number;
+                };
+                const size = SHAPE_DEFAULTS[shape] ?? SHAPE_DEFAULTS.rectangle;
+                liveNodes.set(id, { x, y, width: size.width, height: size.height });
+                touchedNodeIds.add(id);
+                break;
+              }
+              case "moveNode": {
+                const { id, x, y } = call.input as { id: string; x: number; y: number };
+                const existing = liveNodes.get(id);
+                liveNodes.set(id, {
+                  x,
+                  y,
+                  width: existing?.width ?? SHAPE_DEFAULTS.rectangle.width,
+                  height: existing?.height ?? SHAPE_DEFAULTS.rectangle.height,
+                });
+                touchedNodeIds.add(id);
+                break;
+              }
+              case "resizeNode": {
+                const { id, width, height } = call.input as {
+                  id: string;
+                  width: number;
+                  height: number;
+                };
+                const existing = liveNodes.get(id);
+                liveNodes.set(id, { x: existing?.x ?? 0, y: existing?.y ?? 0, width, height });
+                touchedNodeIds.add(id);
+                break;
+              }
               case "updateNodeData": {
                 const { id } = call.input as { id: string };
+                // Label/color/shape only — position and size are
+                // untouched, so liveNodes already has the right rect
+                // (either from the initial read, or from an earlier
+                // addNode/moveNode/resizeNode call this same run).
                 touchedNodeIds.add(id);
                 break;
               }
               case "deleteNode": {
                 const { id } = call.input as { id: string };
+                liveNodes.delete(id);
                 touchedNodeIds.delete(id);
+                break;
+              }
+              case "addEdge": {
+                const { id, source, target } = call.input as {
+                  id: string;
+                  source: string;
+                  target: string;
+                };
+                liveEdges.set(id, { id, source, target });
+                break;
+              }
+              case "deleteEdge": {
+                const { id } = call.input as { id: string };
+                liveEdges.delete(id);
                 break;
               }
             }
@@ -561,9 +657,8 @@ export const designAgent = task({
       });
 
       // --- Settle pass: translate this run's group into place, then
-      // guarantee no overlaps. Reads the whole canvas fresh from storage
-      // now that every tool call above has been applied, so positions,
-      // sizes, and edges are all ground truth rather than hand-tracked. ---
+      // guarantee no overlaps. Uses liveNodes/liveEdges built above —
+      // no storage read here, so nothing can be silently out of date. ---
       if (touchedNodeIds.size > 0) {
         await lb
           .broadcastEvent(payload.roomId, {
@@ -573,40 +668,8 @@ export const designAgent = task({
           })
           .catch(() => {});
 
-        const allRects = new Map<string, Rect>();
-        const allEdges: SimpleEdge[] = [];
-        try {
-          const doc = await lb.getStorageDocument(payload.roomId, "json");
-          const flow = (doc as Record<string, unknown>)?.flow as
-            | {
-                nodes?: Record<
-                  string,
-                  { position?: { x: number; y: number }; width?: number; height?: number }
-                >;
-                edges?: Record<string, { id: string; source: string; target: string }>;
-              }
-            | undefined;
-
-          for (const [id, nd] of Object.entries(flow?.nodes ?? {})) {
-            if (!nd?.position) continue;
-            allRects.set(id, {
-              x: nd.position.x,
-              y: nd.position.y,
-              width: nd.width ?? SHAPE_DEFAULTS.rectangle.width,
-              height: nd.height ?? SHAPE_DEFAULTS.rectangle.height,
-            });
-          }
-
-          for (const edge of Object.values(flow?.edges ?? {})) {
-            if (edge?.source && edge?.target) {
-              allEdges.push({ id: edge.id, source: edge.source, target: edge.target });
-            }
-          }
-        } catch {
-          // Couldn't read storage back — skip the settle pass rather than
-          // risk operating on an incomplete/incorrect picture of the
-          // canvas. Nodes keep the positions the model itself chose.
-        }
+        const allRects = liveNodes;
+        const allEdges = [...liveEdges.values()];
 
         if (allRects.size > 0) {
           const settled = computeSettledLayout(touchedNodeIds, allRects, allEdges);
