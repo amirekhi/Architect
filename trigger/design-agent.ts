@@ -65,8 +65,19 @@ LAYOUT RULES:
 - Horizontal gap between sibling nodes: 240-280px
 - Vertical gap between rows: 160-200px
 - Group related nodes in horizontal rows; use vertical rows for sequential flows
+- Do not overlap nodes — leave clear gaps between every node's bounding box
 - Edge IDs must be unique, e.g. "edge-api-auth", "edge-1"
 - Node IDs must be unique short slugs, e.g. "api-gateway", "user-db", "auth-service"
+- Your x/y placements are the real, final layout for the shapes you place
+  relative to each other — lay them out carefully, since nothing will
+  reflow or re-space your arrangement afterward. A lightweight pass only
+  (a) moves your whole new group next to any existing node you connect to,
+  or clear of existing content if you don't, and (b) nudges apart any
+  boxes that still end up overlapping.
+- If you are extending an existing canvas, prefer connecting new nodes to
+  a relevant existing node with an edge where it makes sense — this lets
+  the layout pass place your new group naturally next to what it relates
+  to, instead of guessing at empty space.
 
 GENERATION RULES:
 - Create 5-12 nodes; do not overcrowd
@@ -153,8 +164,6 @@ const canvasTools = {
 type ToolName = keyof typeof canvasTools;
 type ToolCall = { toolName: ToolName; input: Record<string, unknown> };
 
-// NEW: turns a single tool call into a short, human-readable status line.
-// This is what viewers will see updating live in the sidebar as the agent works.
 function describeAction(call: ToolCall): string {
   switch (call.toolName) {
     case "addNode": {
@@ -188,9 +197,269 @@ function describeAction(call: ToolCall): string {
   }
 }
 
+// ---- Layout settle pass -----------------------------------------------
+//
+// Earlier version of this pass ran dagre on every AI run and used dagre's
+// own computed coordinates as the final layout. That was the wrong tool:
+// dagre re-derives an entirely new rank-based arrangement from the edge
+// graph alone, with no idea the model already placed nodes in sensible
+// rows/columns — so it routinely produced a *worse* layout than what the
+// model generated, and its output still needed heavy overlap clean-up
+// afterward (which wasn't always enough within a fixed iteration budget).
+//
+// This version trusts the AI's own relative arrangement completely and
+// only does two things to it:
+//   1. Translates the whole new group as a single rigid unit into a valid
+//      spot on the canvas (next to a connected existing node, or clear of
+//      existing content if nothing connects to it). A single translation
+//      cannot distort the model's internal layout, unlike per-node dagre
+//      repositioning.
+//   2. Runs a collision-resolution pass as a hard safety net — it nudges
+//      apart any boxes that still overlap after the translation, whether
+//      that's because the model's own layout had a rare overlap, or
+//      because the translated group ended up too close to existing
+//      content. It does not redesign the layout; it only removes overlap.
+
+interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface SimpleEdge {
+  id: string;
+  source: string;
+  target: string;
+}
+
+// Minimum enforced gap between any two node boxes, in canvas pixels.
+const OVERLAP_MARGIN = 24;
+// Preferred gap when anchoring a new group next to a connected existing
+// node, or placing an unconnected group clear of existing content.
+const ANCHOR_GAP = 220;
+const CLEAR_OF_EXISTING_GAP = 160;
+
+function rectsOverlap(a: Rect, b: Rect, margin = 0): boolean {
+  return (
+    a.x < b.x + b.width + margin &&
+    a.x + a.width + margin > b.x &&
+    a.y < b.y + b.height + margin &&
+    a.y + a.height + margin > b.y
+  );
+}
+
+/**
+ * Iteratively separates `movable` rects from each other and from `fixed`
+ * (pre-existing, untouched) rects until nothing overlaps.
+ *
+ * Every pairwise push a node is subject to within one iteration (against
+ * every fixed obstacle AND every other movable node) is summed into a
+ * single delta before being applied, rather than applied immediately per
+ * obstacle. Applying pushes serially can cause a node squeezed between
+ * two things to bounce back and forth, partially undoing each correction;
+ * accumulating first avoids that oscillation and converges reliably.
+ */
+function resolveOverlaps(movable: Map<string, Rect>, fixed: Rect[], iterations = 120): void {
+  const ids = [...movable.keys()];
+  if (ids.length === 0) return;
+
+  for (let iter = 0; iter < iterations; iter++) {
+    const deltas = new Map<string, { dx: number; dy: number }>();
+    for (const id of ids) deltas.set(id, { dx: 0, dy: 0 });
+    let maxOverlap = 0;
+
+    for (const id of ids) {
+      const r = movable.get(id)!;
+      for (const obstacle of fixed) {
+        if (!rectsOverlap(r, obstacle, OVERLAP_MARGIN)) continue;
+
+        const pushRight = obstacle.x + obstacle.width + OVERLAP_MARGIN - r.x;
+        const pushLeft = r.x + r.width + OVERLAP_MARGIN - obstacle.x;
+        const pushDown = obstacle.y + obstacle.height + OVERLAP_MARGIN - r.y;
+        const pushUp = r.y + r.height + OVERLAP_MARGIN - obstacle.y;
+        const minX = Math.min(pushRight, pushLeft);
+        const minY = Math.min(pushDown, pushUp);
+
+        const d = deltas.get(id)!;
+        if (minX < minY) {
+          d.dx += pushRight < pushLeft ? pushRight : -pushLeft;
+        } else {
+          d.dy += pushDown < pushUp ? pushDown : -pushUp;
+        }
+        maxOverlap = Math.max(maxOverlap, Math.min(minX, minY));
+      }
+    }
+
+    for (let i = 0; i < ids.length; i++) {
+      const a = movable.get(ids[i])!;
+      for (let j = i + 1; j < ids.length; j++) {
+        const b = movable.get(ids[j])!;
+        if (!rectsOverlap(a, b, OVERLAP_MARGIN)) continue;
+
+        const pushRight = b.x + b.width + OVERLAP_MARGIN - a.x;
+        const pushLeft = a.x + a.width + OVERLAP_MARGIN - b.x;
+        const pushDown = b.y + b.height + OVERLAP_MARGIN - a.y;
+        const pushUp = a.y + a.height + OVERLAP_MARGIN - b.y;
+        const minX = Math.min(pushRight, pushLeft);
+        const minY = Math.min(pushDown, pushUp);
+
+        const da = deltas.get(ids[i])!;
+        const db = deltas.get(ids[j])!;
+        if (minX < minY) {
+          const shift = (pushRight < pushLeft ? pushRight : -pushLeft) / 2;
+          da.dx -= shift;
+          db.dx += shift;
+        } else {
+          const shift = (pushDown < pushUp ? pushDown : -pushUp) / 2;
+          da.dy -= shift;
+          db.dy += shift;
+        }
+        maxOverlap = Math.max(maxOverlap, Math.min(minX, minY));
+      }
+    }
+
+    for (const id of ids) {
+      const r = movable.get(id)!;
+      const d = deltas.get(id)!;
+      r.x += d.dx;
+      r.y += d.dy;
+    }
+
+    if (maxOverlap <= 0) break;
+  }
+}
+
+/**
+ * Settles this run's touched nodes onto the canvas by translating the
+ * AI's own relative arrangement as a rigid group, then running a
+ * collision safety net. Returns new positions only for nodes that moved.
+ */
+function computeSettledLayout(
+  touchedNodeIds: Set<string>,
+  allRects: Map<string, Rect>,
+  allEdges: SimpleEdge[]
+): Map<string, { x: number; y: number }> {
+  const result = new Map<string, { x: number; y: number }>();
+  if (touchedNodeIds.size === 0) return result;
+
+  const movable = new Map<string, Rect>();
+  const untouchedRects = new Map<string, Rect>();
+  for (const [id, rect] of allRects) {
+    if (touchedNodeIds.has(id)) movable.set(id, { ...rect });
+    else untouchedRects.set(id, rect);
+  }
+  if (movable.size === 0) return result;
+
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (untouchedRects.size > 0) {
+    // Look for edges connecting a moved/new node to an existing untouched
+    // node — these become anchors. For each anchor edge, compute how far
+    // the connected node would need to shift so it sits ANCHOR_GAP away
+    // from the anchor, in whatever direction it's already roughly facing
+    // (so "left of" stays left, "below" stays below). Average across all
+    // anchor edges if there's more than one.
+    let sumDx = 0;
+    let sumDy = 0;
+    let anchorCount = 0;
+
+    for (const edge of allEdges) {
+      const srcMovable = movable.has(edge.source);
+      const tgtMovable = movable.has(edge.target);
+
+      let movedId: string | null = null;
+      let anchorRect: Rect | null = null;
+      if (srcMovable && !tgtMovable && untouchedRects.has(edge.target)) {
+        movedId = edge.source;
+        anchorRect = untouchedRects.get(edge.target)!;
+      } else if (tgtMovable && !srcMovable && untouchedRects.has(edge.source)) {
+        movedId = edge.target;
+        anchorRect = untouchedRects.get(edge.source)!;
+      }
+      if (!movedId || !anchorRect) continue;
+
+      const node = movable.get(movedId)!;
+      const nodeCenterX = node.x + node.width / 2;
+      const nodeCenterY = node.y + node.height / 2;
+      const anchorCenterX = anchorRect.x + anchorRect.width / 2;
+      const anchorCenterY = anchorRect.y + anchorRect.height / 2;
+
+      const dxRaw = nodeCenterX - anchorCenterX;
+      const dyRaw = nodeCenterY - anchorCenterY;
+      const dist = Math.hypot(dxRaw, dyRaw) || 1;
+      const desiredDist = (anchorRect.width + node.width) / 2 + ANCHOR_GAP;
+      const desiredCenterX = anchorCenterX + (dxRaw / dist) * desiredDist;
+      const desiredCenterY = anchorCenterY + (dyRaw / dist) * desiredDist;
+
+      sumDx += desiredCenterX - nodeCenterX;
+      sumDy += desiredCenterY - nodeCenterY;
+      anchorCount += 1;
+    }
+
+    if (anchorCount > 0) {
+      offsetX = sumDx / anchorCount;
+      offsetY = sumDy / anchorCount;
+    } else {
+      // Nothing in the new group connects to existing content — place
+      // the whole group clear of everything else instead of trusting the
+      // model's guessed absolute coordinates (which have no relationship
+      // to where a prior run's content actually settled).
+      let minX = Infinity;
+      let minY = Infinity;
+      for (const r of movable.values()) {
+        minX = Math.min(minX, r.x);
+        minY = Math.min(minY, r.y);
+      }
+      let maxExistingX = -Infinity;
+      let minExistingY = Infinity;
+      for (const r of untouchedRects.values()) {
+        maxExistingX = Math.max(maxExistingX, r.x + r.width);
+        minExistingY = Math.min(minExistingY, r.y);
+      }
+      offsetX = maxExistingX + CLEAR_OF_EXISTING_GAP - minX;
+      offsetY = minExistingY - minY;
+    }
+  }
+  // else: canvas had no other content — leave the AI's own placement
+  // untouched (offsetX/offsetY stay 0).
+
+  if (offsetX !== 0 || offsetY !== 0) {
+    for (const r of movable.values()) {
+      r.x += offsetX;
+      r.y += offsetY;
+    }
+  }
+
+  // Hard safety net, independent of everything above: no overlaps against
+  // existing nodes, and no overlaps within the new group.
+  resolveOverlaps(movable, [...untouchedRects.values()]);
+
+  for (const [id, rect] of movable) {
+    const original = allRects.get(id)!;
+    const x = Math.round(rect.x);
+    const y = Math.round(rect.y);
+    if (x !== original.x || y !== original.y) {
+      result.set(id, { x, y });
+    }
+  }
+
+  return result;
+}
+
 export const designAgent = task({
   id: "design-agent",
   retry: { maxAttempts: 2 },
+  // Serializes runs that target the same room (concurrencyKey is passed
+  // as roomId at trigger time — see app/api/ai/design/route.ts). Without
+  // this, two prompts fired close together in the same room can both read
+  // the canvas snapshot before either has written, so each computes a
+  // layout with no knowledge of the other's new nodes and their results
+  // can land on top of each other.
+  queue: {
+    concurrencyLimit: 1,
+  },
   run: async (payload: { prompt: string; roomId: string; userId: string }) => {
     const lb = getLiveblocks();
     const google = createGoogleGenerativeAI({
@@ -229,10 +498,16 @@ export const designAgent = task({
         // No storage yet — treat as empty
       }
 
-      // NEW: these get filled in live, as each step finishes, instead of
-      // being computed once from result.steps after generateText resolves.
       let appliedCount = 0;
       let summary = "Design applied to canvas.";
+
+      // Only tracks WHICH node ids this run touched (added, moved,
+      // resized, relabeled/recolored). Their actual positions/sizes are
+      // read straight from storage after all tool calls are applied —
+      // see the settle pass below — rather than tracked by hand here,
+      // which removes a whole class of bugs where our own bookkeeping
+      // could drift from what was actually written to storage.
+      const touchedNodeIds = new Set<string>();
 
       const result = await generateText({
         model: google(process.env.GEMINI_MODEL ?? "gemini-3.1-flash-lite"),
@@ -240,11 +515,6 @@ export const designAgent = task({
         prompt: `User request: ${payload.prompt}\n\n${canvasContext}`,
         tools: canvasTools,
         toolChoice: "required",
-        // NEW: this is the core of the change. The AI SDK awaits this callback
-        // after each step of tool-calling before letting the model continue —
-        // so applying the mutation here means Liveblocks (and every connected
-        // browser) sees the node/edge the instant the model decides on it,
-        // not after the whole response is done.
         onStepFinish: async (step) => {
           const calls = (step.toolCalls ?? []) as ToolCall[];
 
@@ -253,6 +523,22 @@ export const designAgent = task({
               summary =
                 (call.input as { summary?: string } | undefined)?.summary ?? summary;
               continue;
+            }
+
+            switch (call.toolName) {
+              case "addNode":
+              case "moveNode":
+              case "resizeNode":
+              case "updateNodeData": {
+                const { id } = call.input as { id: string };
+                touchedNodeIds.add(id);
+                break;
+              }
+              case "deleteNode": {
+                const { id } = call.input as { id: string };
+                touchedNodeIds.delete(id);
+                break;
+              }
             }
 
             await lb.mutateStorage(payload.roomId, ({ root }) => {
@@ -273,6 +559,71 @@ export const designAgent = task({
           }
         },
       });
+
+      // --- Settle pass: translate this run's group into place, then
+      // guarantee no overlaps. Reads the whole canvas fresh from storage
+      // now that every tool call above has been applied, so positions,
+      // sizes, and edges are all ground truth rather than hand-tracked. ---
+      if (touchedNodeIds.size > 0) {
+        await lb
+          .broadcastEvent(payload.roomId, {
+            type: "ai-status",
+            message: "Arranging layout…",
+            status: "thinking",
+          })
+          .catch(() => {});
+
+        const allRects = new Map<string, Rect>();
+        const allEdges: SimpleEdge[] = [];
+        try {
+          const doc = await lb.getStorageDocument(payload.roomId, "json");
+          const flow = (doc as Record<string, unknown>)?.flow as
+            | {
+                nodes?: Record<
+                  string,
+                  { position?: { x: number; y: number }; width?: number; height?: number }
+                >;
+                edges?: Record<string, { id: string; source: string; target: string }>;
+              }
+            | undefined;
+
+          for (const [id, nd] of Object.entries(flow?.nodes ?? {})) {
+            if (!nd?.position) continue;
+            allRects.set(id, {
+              x: nd.position.x,
+              y: nd.position.y,
+              width: nd.width ?? SHAPE_DEFAULTS.rectangle.width,
+              height: nd.height ?? SHAPE_DEFAULTS.rectangle.height,
+            });
+          }
+
+          for (const edge of Object.values(flow?.edges ?? {})) {
+            if (edge?.source && edge?.target) {
+              allEdges.push({ id: edge.id, source: edge.source, target: edge.target });
+            }
+          }
+        } catch {
+          // Couldn't read storage back — skip the settle pass rather than
+          // risk operating on an incomplete/incorrect picture of the
+          // canvas. Nodes keep the positions the model itself chose.
+        }
+
+        if (allRects.size > 0) {
+          const settled = computeSettledLayout(touchedNodeIds, allRects, allEdges);
+
+          if (settled.size > 0) {
+            await lb.mutateStorage(payload.roomId, ({ root }) => {
+              const flow = root.get("flow");
+              if (!flow) return;
+              const nodes = flow.get("nodes");
+              for (const [id, position] of settled) {
+                const n = nodes.get(id) as { set(k: string, v: unknown): void } | undefined;
+                if (n) n.set("position", position);
+              }
+            });
+          }
+        }
+      }
 
       await lb
         .broadcastEvent(payload.roomId, {
