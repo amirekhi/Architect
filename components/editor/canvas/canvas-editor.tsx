@@ -26,6 +26,7 @@ import { CanvasControls } from "@/components/editor/canvas/canvas-controls"
 import { PresenceCursors } from "@/components/editor/canvas/presence-cursors"
 import { CollaboratorAvatars } from "@/components/editor/canvas/collaborator-avatars"
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts"
+import { useResolveNodeOverlap } from "@/hooks/use-resolve-node-overlap"
 import type { CanvasTemplate } from "@/components/editor/starter-templates"
 import { useCanvasAutosave, type SaveStatus } from "@/hooks/use-canvas-autosave"
 
@@ -165,6 +166,19 @@ export function CanvasEditor({ projectId, pendingTemplate, onTemplateImported, o
 
   useKeyboardShortcuts({ reactFlow, undo, redo })
 
+  // Client-side collision correction. This is what keeps the canvas
+  // overlap-free *between* AI runs — the AI's own settle pass only
+  // guarantees no-overlap at the instant it finishes; a manual drag can
+  // undo that guarantee with no server involvement, so we re-check here.
+  const resolveNodeOverlap = useResolveNodeOverlap()
+
+  const onNodeDragStop = useCallback(
+    (_event: MouseEvent | TouchEvent, node: CanvasNode) => {
+      resolveNodeOverlap(node.id)
+    },
+    [resolveNodeOverlap]
+  )
+
   const onConnect = useCallback(
     (connection: Connection) => {
       if (!connection.source || !connection.target) return
@@ -247,6 +261,7 @@ export function CanvasEditor({ projectId, pendingTemplate, onTemplateImported, o
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
+        onNodeDragStop={onNodeDragStop}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         connectionMode={ConnectionMode.Loose}

@@ -7,6 +7,7 @@ import { useMutation } from "@liveblocks/react"
 import { LiveObject } from "@liveblocks/client"
 import type { CanvasNode, NodeShape } from "@/types/canvas"
 import { NODE_COLORS } from "@/types/canvas"
+import { useResolveNodeOverlap } from "@/hooks/use-resolve-node-overlap"
 
 const DEFAULT_FILL = NODE_COLORS[0].fill
 const DEFAULT_TEXT = NODE_COLORS[0].text
@@ -132,6 +133,15 @@ export function CanvasNodeComponent({ id, data, selected }: NodeProps<CanvasNode
     liveData.set("textColor", colorText)
   }, [id])
 
+  // Corrects overlap against other nodes once a resize finishes. Resizing
+  // a node larger can push it into a neighbor that the AI's settle pass
+  // (or a previous drag) had placed with only just enough clearance —
+  // nothing else in the app catches that case, so we check here.
+  const resolveNodeOverlap = useResolveNodeOverlap()
+  const onResizeEnd = useCallback(() => {
+    resolveNodeOverlap(id)
+  }, [resolveNodeOverlap, id])
+
   const startEditing = useCallback((e: React.MouseEvent) => {
     e.stopPropagation()
     setIsEditing(true)
@@ -187,6 +197,7 @@ export function CanvasNodeComponent({ id, data, selected }: NodeProps<CanvasNode
         minHeight={MIN_HEIGHT}
         handleStyle={RESIZER_HANDLE_STYLE}
         lineStyle={RESIZER_LINE_STYLE}
+        onResizeEnd={onResizeEnd}
       />
 
       <NodeToolbar isVisible={selected ?? false} position={Position.Top}>
