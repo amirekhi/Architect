@@ -17,6 +17,8 @@ const RESIZER_COLOR = "rgba(255,255,255,0.3)"
 
 const MIN_WIDTH = 60
 const MIN_HEIGHT = 40
+const MIN_CONTAINER_WIDTH = 220
+const MIN_CONTAINER_HEIGHT = 160
 
 const HANDLE_CLS =
   "!h-2.5 !w-2.5 !rounded-full !border-2 !border-bg-base !bg-white opacity-0 transition-opacity group-hover/node:opacity-100"
@@ -110,11 +112,13 @@ type LiveNodeData = LiveObject<{
 }>
 
 export function CanvasNodeComponent({ id, data, selected }: NodeProps<CanvasNode>) {
+  const isContainer = Boolean(data.isContainer)
+
   const fill = data.color ?? DEFAULT_FILL
   const textColor = data.textColor ?? DEFAULT_TEXT
   const shape = data.shape ?? "rectangle"
   const stroke = selected ? BORDER_SELECTED : BORDER_REST
-  const isSvg = shape === "diamond" || shape === "hexagon" || shape === "cylinder"
+  const isSvg = !isContainer && (shape === "diamond" || shape === "hexagon" || shape === "cylinder")
 
   const [isEditing, setIsEditing] = useState(false)
   const editRef = useRef<HTMLDivElement>(null)
@@ -133,10 +137,9 @@ export function CanvasNodeComponent({ id, data, selected }: NodeProps<CanvasNode
     liveData.set("textColor", colorText)
   }, [id])
 
-  // Corrects overlap against other nodes once a resize finishes. Resizing
-  // a node larger can push it into a neighbor that the AI's settle pass
-  // (or a previous drag) had placed with only just enough clearance —
-  // nothing else in the app catches that case, so we check here.
+  // Corrects overlap against other (non-container) nodes once a resize
+  // finishes. The hook itself skips this entirely when the resized node
+  // is a container — see hooks/use-resolve-node-overlap.ts.
   const resolveNodeOverlap = useResolveNodeOverlap()
   const onResizeEnd = useCallback(() => {
     resolveNodeOverlap(id)
@@ -175,6 +178,108 @@ export function CanvasNodeComponent({ id, data, selected }: NodeProps<CanvasNode
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isEditing])
 
+  // ---- Container rendering -------------------------------------------
+  // A dashed boundary box with a label chip pinned to the top-left
+  // corner, like a VPC/subnet/AZ box in a cloud architecture diagram.
+  // Deliberately has no fill covering its interior (so members placed
+  // inside stay fully visible) and no connection Handles (containers are
+  // a visual grouping, not something edges usually connect to).
+  if (isContainer) {
+    return (
+      <div
+        style={{ width: "100%", height: "100%", position: "relative" }}
+        className="group/node"
+        onDoubleClick={startEditing}
+      >
+        <NodeResizer
+          isVisible={selected ?? false}
+          color={RESIZER_COLOR}
+          minWidth={MIN_CONTAINER_WIDTH}
+          minHeight={MIN_CONTAINER_HEIGHT}
+          handleStyle={RESIZER_HANDLE_STYLE}
+          lineStyle={RESIZER_LINE_STYLE}
+          onResizeEnd={onResizeEnd}
+        />
+
+        <NodeToolbar isVisible={selected ?? false} position={Position.Top}>
+          <div className="nodrag nopan flex items-center gap-1.5 rounded-full border border-border-default bg-bg-surface/95 px-2.5 py-1.5 shadow-xl backdrop-blur-xl">
+            {NODE_COLORS.map((pair) => (
+              <ColorSwatch
+                key={pair.fill}
+                pair={pair}
+                isActive={pair.fill === fill}
+                onSelect={updateNodeColor}
+              />
+            ))}
+          </div>
+        </NodeToolbar>
+
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            borderRadius: 16,
+            border: `1.5px dashed ${textColor}66`,
+            background: `${textColor}0A`,
+            pointerEvents: "none",
+          }}
+        />
+
+        <div
+          className="nodrag nopan"
+          style={{
+            position: "absolute",
+            top: -1,
+            left: 16,
+            transform: "translateY(-50%)",
+            background: "var(--color-bg-base)",
+            padding: "0 8px",
+            maxWidth: "calc(100% - 32px)",
+            cursor: "text",
+          }}
+          onDoubleClick={startEditing}
+          onMouseDown={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {isEditing ? (
+            <div
+              ref={editRef}
+              contentEditable
+              suppressContentEditableWarning
+              spellCheck={false}
+              className="outline-none"
+              style={{
+                color: textColor,
+                fontSize: 12,
+                fontWeight: 600,
+                letterSpacing: "0.02em",
+                textTransform: "uppercase",
+                whiteSpace: "nowrap",
+                minWidth: 40,
+              }}
+              onBlur={commitEdit}
+              onKeyDown={handleKeyDown}
+            />
+          ) : (
+            <span
+              style={{
+                color: textColor,
+                fontSize: 12,
+                fontWeight: 600,
+                letterSpacing: "0.02em",
+                textTransform: "uppercase",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {data.label || <span style={{ opacity: 0.5, textTransform: "none" }}>Double-click to label</span>}
+            </span>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // ---- Regular shape rendering (unchanged) ----------------------------
   const labelContent = (
     <span
       className={isSvg ? "relative z-10 truncate px-3" : "truncate px-3"}

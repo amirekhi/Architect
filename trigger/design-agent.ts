@@ -5,7 +5,13 @@ import { z } from "zod";
 import { LiveObject } from "@liveblocks/client";
 import type { LiveblocksNode, LiveblocksEdge } from "@liveblocks/react-flow";
 import { getLiveblocks } from "@/lib/liveblocks";
-import { NODE_COLORS, SHAPE_DEFAULTS, NODE_SHAPES } from "@/types/canvas";
+import {
+  NODE_COLORS,
+  SHAPE_DEFAULTS,
+  NODE_SHAPES,
+  CONTAINER_DEFAULTS,
+  CONTAINER_Z_INDEX,
+} from "@/types/canvas";
 import type { CanvasNode, CanvasEdge, NodeShape } from "@/types/canvas";
 
 const AI_USER_ID = "ghost-ai";
@@ -79,6 +85,28 @@ LAYOUT RULES:
   the layout pass place your new group naturally next to what it relates
   to, instead of guessing at empty space.
 
+CONTAINERS (boundary boxes — use sparingly, only when genuinely warranted):
+- A container is a labeled box drawn around a group of nodes to show a
+  real physical or logical boundary — a VPC, a public or private subnet,
+  an availability zone or region, an on-prem vs. cloud split, a security
+  or trust boundary, or an environment (dev/staging/prod). It is NOT a
+  generic way to group things you think are "related" — a plain
+  request/response flow, or a handful of services with no actual boundary
+  concept, should have NO containers at all. Most requests need zero.
+- To draw one: call addContainer with just an id, a label, and a
+  colorIndex. Do not try to give it a position or size — you can't, the
+  tool doesn't take one. Its geometry is computed automatically from
+  whichever nodes you assign to it, after you finish placing them.
+- To put a node inside a container: pass that container's id as
+  containerId when calling addNode (for a new node) or updateNodeData
+  (for a node that already exists). A node with no containerId sits
+  directly on the canvas, outside any boundary.
+- Never call moveNode or resizeNode on a container's id — its position
+  and size are derived automatically from its members and any explicit
+  move/resize you make will simply be overwritten.
+- Prefer at most 2-4 containers per design. Do not put a container inside
+  another container (nesting isn't supported).
+
 GENERATION RULES:
 - Create 5-12 nodes; do not overcrowd
 - Add edges to show data/request flow
@@ -87,6 +115,7 @@ GENERATION RULES:
 
 INSTRUCTIONS:
 - Call addNode for each node you want to place on the canvas
+- Call addContainer for each boundary box you genuinely need (see CONTAINERS above), and set containerId on its members
 - Call addEdge for each connection between nodes
 - Call finalizeDesign last with a 1-2 sentence summary of what was designed`;
 }
@@ -105,10 +134,16 @@ const canvasTools = {
       colorIndex: z.number().int().min(0).max(7).describe("Color palette index 0-7"),
       x: z.number().describe("X position in pixels"),
       y: z.number().describe("Y position in pixels"),
+      containerId: z
+        .string()
+        .optional()
+        .describe(
+          "Optional: id of a container (created via addContainer) this node belongs inside. Omit if it isn't part of any boundary."
+        ),
     }),
   }),
   moveNode: tool({
-    description: "Move an existing node to a new position",
+    description: "Move an existing node to a new position. Do not use this on a container.",
     inputSchema: z.object({
       id: z.string().describe("ID of the node to move"),
       x: z.number(),
@@ -116,7 +151,7 @@ const canvasTools = {
     }),
   }),
   resizeNode: tool({
-    description: "Resize an existing node",
+    description: "Resize an existing node. Do not use this on a container.",
     inputSchema: z.object({
       id: z.string(),
       width: z.number().positive(),
@@ -124,18 +159,31 @@ const canvasTools = {
     }),
   }),
   updateNodeData: tool({
-    description: "Update the label, shape, or color of an existing node",
+    description: "Update the label, shape, color, or container membership of an existing node",
     inputSchema: z.object({
       id: z.string(),
       label: z.string().optional(),
       shape: z.enum(NODE_SHAPES).optional(),
       colorIndex: z.number().int().min(0).max(7).optional(),
+      containerId: z
+        .string()
+        .optional()
+        .describe("Optional: assign this existing node to a container created via addContainer"),
     }),
   }),
   deleteNode: tool({
     description: "Delete a node from the canvas",
     inputSchema: z.object({
       id: z.string(),
+    }),
+  }),
+  addContainer: tool({
+    description:
+      "Draw a labeled boundary box (e.g. a VPC, subnet, availability zone, trust boundary, or environment) around a group of related nodes. Only use this when the request genuinely implies a real boundary — see the CONTAINERS section of your instructions. Its position and size are computed automatically from whichever nodes are assigned to it via addNode's or updateNodeData's containerId; do not call moveNode or resizeNode on it.",
+    inputSchema: z.object({
+      id: z.string().describe('Unique slug ID e.g. "prod-vpc", "public-subnet"'),
+      label: z.string().describe('Boundary label, e.g. "Production VPC", "Public Subnet"'),
+      colorIndex: z.number().int().min(0).max(7).describe("Color palette index 0-7, used for the border and label"),
     }),
   }),
   addEdge: tool({
@@ -170,6 +218,10 @@ function describeAction(call: ToolCall): string {
       const { label } = call.input as { label?: string };
       return `Adding "${label || "node"}"…`;
     }
+    case "addContainer": {
+      const { label } = call.input as { label?: string };
+      return `Drawing boundary "${label || "container"}"…`;
+    }
     case "addEdge": {
       const { source, target } = call.input as { source: string; target: string };
       return `Connecting ${source} → ${target}…`;
@@ -199,26 +251,18 @@ function describeAction(call: ToolCall): string {
 
 // ---- Layout settle pass -----------------------------------------------
 //
-// Earlier version of this pass ran dagre on every AI run and used dagre's
-// own computed coordinates as the final layout. That was the wrong tool:
-// dagre re-derives an entirely new rank-based arrangement from the edge
-// graph alone, with no idea the model already placed nodes in sensible
-// rows/columns — so it routinely produced a *worse* layout than what the
-// model generated, and its output still needed heavy overlap clean-up
-// afterward (which wasn't always enough within a fixed iteration budget).
-//
-// This version trusts the AI's own relative arrangement completely and
-// only does two things to it:
-//   1. Translates the whole new group as a single rigid unit into a valid
-//      spot on the canvas (next to a connected existing node, or clear of
-//      existing content if nothing connects to it). A single translation
-//      cannot distort the model's internal layout, unlike per-node dagre
-//      repositioning.
-//   2. Runs a collision-resolution pass as a hard safety net — it nudges
-//      apart any boxes that still overlap after the translation, whether
-//      that's because the model's own layout had a rare overlap, or
-//      because the translated group ended up too close to existing
-//      content. It does not redesign the layout; it only removes overlap.
+// Two things happen here, in order:
+//   1. Regular (non-container) touched nodes are translated as a rigid
+//      group into a valid spot (anchored to a connected existing node, or
+//      clear of existing content), then a collision pass nudges apart
+//      anything that still overlaps. Containers never participate in this
+//      — see the CONTAINERS notes throughout.
+//   2. Every container that was touched this run, or whose membership
+//      changed this run, is auto-fit: its position and size are set to
+//      the bounding box of its current members (using their FINAL,
+//      post-settle positions from step 1) plus padding. The model never
+//      has to get container geometry right — it only has to say which
+//      nodes go in which container.
 
 interface Rect {
   x: number;
@@ -227,18 +271,37 @@ interface Rect {
   height: number;
 }
 
+interface SettledRect {
+  x: number;
+  y: number;
+  // Present only for containers — a container's size is derived from its
+  // members, so unlike a regular node its box can change dimensions, not
+  // just position.
+  width?: number;
+  height?: number;
+}
+
 interface SimpleEdge {
   id: string;
   source: string;
   target: string;
 }
 
-// Minimum enforced gap between any two node boxes, in canvas pixels.
+// Minimum enforced gap between any two (non-container) node boxes, in
+// canvas pixels.
 const OVERLAP_MARGIN = 24;
 // Preferred gap when anchoring a new group next to a connected existing
-// node, or placing an unconnected group clear of existing content.
+// node, or placing an unconnected group/empty container clear of
+// existing content.
 const ANCHOR_GAP = 220;
 const CLEAR_OF_EXISTING_GAP = 160;
+
+// Padding between a container's edge and its members' bounding box. Top
+// padding is larger to leave room for the label chip that sits on the
+// container's top border.
+const CONTAINER_PADDING_X = 40;
+const CONTAINER_PADDING_TOP = 56;
+const CONTAINER_PADDING_BOTTOM = 32;
 
 function rectsOverlap(a: Rect, b: Rect, margin = 0): boolean {
   return (
@@ -331,118 +394,219 @@ function resolveOverlaps(movable: Map<string, Rect>, fixed: Rect[], iterations =
 }
 
 /**
- * Settles this run's touched nodes onto the canvas by translating the
- * AI's own relative arrangement as a rigid group, then running a
- * collision safety net. Returns new positions only for nodes that moved.
+ * Settles this run's touched nodes onto the canvas, then auto-fits any
+ * containers around their members. Returns new geometry only for nodes
+ * that actually changed — regular nodes get {x,y}; containers that were
+ * refit also get {width,height}.
  */
 function computeSettledLayout(
   touchedNodeIds: Set<string>,
   allRects: Map<string, Rect>,
-  allEdges: SimpleEdge[]
-): Map<string, { x: number; y: number }> {
-  const result = new Map<string, { x: number; y: number }>();
-  if (touchedNodeIds.size === 0) return result;
+  allEdges: SimpleEdge[],
+  containerNodeIds: Set<string>,
+  nodeContainerId: Map<string, string>
+): Map<string, SettledRect> {
+  const result = new Map<string, SettledRect>();
 
+  // ---- Phase 1: settle regular (non-container) touched nodes ----
   const movable = new Map<string, Rect>();
   const untouchedRects = new Map<string, Rect>();
   for (const [id, rect] of allRects) {
+    // Containers are handled entirely separately in phase 2 — they never
+    // participate in translation or collision as either a mover or an
+    // obstacle. A container is meant to be overlapped by its members, not
+    // to block anything.
+    if (containerNodeIds.has(id)) continue;
     if (touchedNodeIds.has(id)) movable.set(id, { ...rect });
     else untouchedRects.set(id, rect);
   }
-  if (movable.size === 0) return result;
 
-  let offsetX = 0;
-  let offsetY = 0;
+  if (movable.size > 0) {
+    let offsetX = 0;
+    let offsetY = 0;
 
-  if (untouchedRects.size > 0) {
-    // Look for edges connecting a moved/new node to an existing untouched
-    // node — these become anchors. For each anchor edge, compute how far
-    // the connected node would need to shift so it sits ANCHOR_GAP away
-    // from the anchor, in whatever direction it's already roughly facing
-    // (so "left of" stays left, "below" stays below). Average across all
-    // anchor edges if there's more than one.
-    let sumDx = 0;
-    let sumDy = 0;
-    let anchorCount = 0;
+    if (untouchedRects.size > 0) {
+      // Look for edges connecting a moved/new node to an existing
+      // untouched node — these become anchors. For each anchor edge,
+      // compute how far the connected node would need to shift so it
+      // sits ANCHOR_GAP away from the anchor, in whatever direction it's
+      // already roughly facing. Average across all anchor edges if
+      // there's more than one.
+      let sumDx = 0;
+      let sumDy = 0;
+      let anchorCount = 0;
 
-    for (const edge of allEdges) {
-      const srcMovable = movable.has(edge.source);
-      const tgtMovable = movable.has(edge.target);
+      for (const edge of allEdges) {
+        const srcMovable = movable.has(edge.source);
+        const tgtMovable = movable.has(edge.target);
 
-      let movedId: string | null = null;
-      let anchorRect: Rect | null = null;
-      if (srcMovable && !tgtMovable && untouchedRects.has(edge.target)) {
-        movedId = edge.source;
-        anchorRect = untouchedRects.get(edge.target)!;
-      } else if (tgtMovable && !srcMovable && untouchedRects.has(edge.source)) {
-        movedId = edge.target;
-        anchorRect = untouchedRects.get(edge.source)!;
+        let movedId: string | null = null;
+        let anchorRect: Rect | null = null;
+        if (srcMovable && !tgtMovable && untouchedRects.has(edge.target)) {
+          movedId = edge.source;
+          anchorRect = untouchedRects.get(edge.target)!;
+        } else if (tgtMovable && !srcMovable && untouchedRects.has(edge.source)) {
+          movedId = edge.target;
+          anchorRect = untouchedRects.get(edge.source)!;
+        }
+        if (!movedId || !anchorRect) continue;
+
+        const node = movable.get(movedId)!;
+        const nodeCenterX = node.x + node.width / 2;
+        const nodeCenterY = node.y + node.height / 2;
+        const anchorCenterX = anchorRect.x + anchorRect.width / 2;
+        const anchorCenterY = anchorRect.y + anchorRect.height / 2;
+
+        const dxRaw = nodeCenterX - anchorCenterX;
+        const dyRaw = nodeCenterY - anchorCenterY;
+        const dist = Math.hypot(dxRaw, dyRaw) || 1;
+        const desiredDist = (anchorRect.width + node.width) / 2 + ANCHOR_GAP;
+        const desiredCenterX = anchorCenterX + (dxRaw / dist) * desiredDist;
+        const desiredCenterY = anchorCenterY + (dyRaw / dist) * desiredDist;
+
+        sumDx += desiredCenterX - nodeCenterX;
+        sumDy += desiredCenterY - nodeCenterY;
+        anchorCount += 1;
       }
-      if (!movedId || !anchorRect) continue;
 
-      const node = movable.get(movedId)!;
-      const nodeCenterX = node.x + node.width / 2;
-      const nodeCenterY = node.y + node.height / 2;
-      const anchorCenterX = anchorRect.x + anchorRect.width / 2;
-      const anchorCenterY = anchorRect.y + anchorRect.height / 2;
-
-      const dxRaw = nodeCenterX - anchorCenterX;
-      const dyRaw = nodeCenterY - anchorCenterY;
-      const dist = Math.hypot(dxRaw, dyRaw) || 1;
-      const desiredDist = (anchorRect.width + node.width) / 2 + ANCHOR_GAP;
-      const desiredCenterX = anchorCenterX + (dxRaw / dist) * desiredDist;
-      const desiredCenterY = anchorCenterY + (dyRaw / dist) * desiredDist;
-
-      sumDx += desiredCenterX - nodeCenterX;
-      sumDy += desiredCenterY - nodeCenterY;
-      anchorCount += 1;
+      if (anchorCount > 0) {
+        offsetX = sumDx / anchorCount;
+        offsetY = sumDy / anchorCount;
+      } else {
+        // Nothing in the new group connects to existing content — place
+        // the whole group clear of everything else instead of trusting
+        // the model's guessed absolute coordinates.
+        let minX = Infinity;
+        let minY = Infinity;
+        for (const r of movable.values()) {
+          minX = Math.min(minX, r.x);
+          minY = Math.min(minY, r.y);
+        }
+        let maxExistingX = -Infinity;
+        let minExistingY = Infinity;
+        for (const r of untouchedRects.values()) {
+          maxExistingX = Math.max(maxExistingX, r.x + r.width);
+          minExistingY = Math.min(minExistingY, r.y);
+        }
+        offsetX = maxExistingX + CLEAR_OF_EXISTING_GAP - minX;
+        offsetY = minExistingY - minY;
+      }
     }
+    // else: canvas had no other (non-container) content — leave the AI's
+    // own placement untouched (offsetX/offsetY stay 0).
 
-    if (anchorCount > 0) {
-      offsetX = sumDx / anchorCount;
-      offsetY = sumDy / anchorCount;
-    } else {
-      // Nothing in the new group connects to existing content — place
-      // the whole group clear of everything else instead of trusting the
-      // model's guessed absolute coordinates (which have no relationship
-      // to where a prior run's content actually settled).
-      let minX = Infinity;
-      let minY = Infinity;
+    if (offsetX !== 0 || offsetY !== 0) {
       for (const r of movable.values()) {
-        minX = Math.min(minX, r.x);
-        minY = Math.min(minY, r.y);
+        r.x += offsetX;
+        r.y += offsetY;
       }
-      let maxExistingX = -Infinity;
-      let minExistingY = Infinity;
-      for (const r of untouchedRects.values()) {
-        maxExistingX = Math.max(maxExistingX, r.x + r.width);
-        minExistingY = Math.min(minExistingY, r.y);
-      }
-      offsetX = maxExistingX + CLEAR_OF_EXISTING_GAP - minX;
-      offsetY = minExistingY - minY;
     }
-  }
-  // else: canvas had no other content — leave the AI's own placement
-  // untouched (offsetX/offsetY stay 0).
 
-  if (offsetX !== 0 || offsetY !== 0) {
-    for (const r of movable.values()) {
-      r.x += offsetX;
-      r.y += offsetY;
+    resolveOverlaps(movable, [...untouchedRects.values()]);
+
+    for (const [id, rect] of movable) {
+      const original = allRects.get(id)!;
+      const x = Math.round(rect.x);
+      const y = Math.round(rect.y);
+      if (x !== original.x || y !== original.y) {
+        result.set(id, { x, y });
+      }
     }
   }
 
-  // Hard safety net, independent of everything above: no overlaps against
-  // existing nodes, and no overlaps within the new group.
-  resolveOverlaps(movable, [...untouchedRects.values()]);
+  // ---- Phase 2: auto-fit containers around their members ----
+  if (containerNodeIds.size === 0) return result;
 
-  for (const [id, rect] of movable) {
-    const original = allRects.get(id)!;
-    const x = Math.round(rect.x);
-    const y = Math.round(rect.y);
-    if (x !== original.x || y !== original.y) {
-      result.set(id, { x, y });
+  // A regular node's final rect after phase 1: its settled position if it
+  // moved, otherwise its original position — always with its original
+  // width/height, since translation never resizes anything.
+  function finalRectFor(id: string): Rect | undefined {
+    const original = allRects.get(id);
+    if (!original) return undefined;
+    const settled = result.get(id);
+    if (!settled) return original;
+    return { x: settled.x, y: settled.y, width: original.width, height: original.height };
+  }
+
+  // Only refit a container if it's new this run, or at least one of its
+  // members changed this run — a container nobody touched, whose members
+  // also weren't touched, is left exactly as it is.
+  const containersToFit = new Set<string>();
+  for (const id of containerNodeIds) {
+    if (touchedNodeIds.has(id)) containersToFit.add(id);
+  }
+  for (const [nodeId, containerId] of nodeContainerId) {
+    if (touchedNodeIds.has(nodeId) && containerNodeIds.has(containerId)) {
+      containersToFit.add(containerId);
     }
+  }
+  if (containersToFit.size === 0) return result;
+
+  const membersByContainer = new Map<string, string[]>();
+  for (const [nodeId, containerId] of nodeContainerId) {
+    if (!containerNodeIds.has(containerId)) continue; // stale/unknown container reference
+    if (!allRects.has(nodeId)) continue; // member was deleted this run
+    const list = membersByContainer.get(containerId) ?? [];
+    list.push(nodeId);
+    membersByContainer.set(containerId, list);
+  }
+
+  // Fallback spot for a container with no members yet (e.g. addContainer
+  // was called but nothing was assigned to it) — clear of everything
+  // else already on the canvas, same idea as the no-anchor case above.
+  let fallbackX: number | null = null;
+  let fallbackY: number | null = null;
+  {
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let any = false;
+    for (const [id, r] of allRects) {
+      if (containerNodeIds.has(id)) continue;
+      maxX = Math.max(maxX, r.x + r.width);
+      minY = Math.min(minY, r.y);
+      any = true;
+    }
+    if (any) {
+      fallbackX = maxX + CLEAR_OF_EXISTING_GAP;
+      fallbackY = minY;
+    }
+  }
+
+  for (const containerId of containersToFit) {
+    const memberRects = (membersByContainer.get(containerId) ?? [])
+      .map((id) => finalRectFor(id))
+      .filter((r): r is Rect => Boolean(r));
+
+    if (memberRects.length === 0) {
+      const current = allRects.get(containerId);
+      if (current && fallbackX !== null && fallbackY !== null) {
+        result.set(containerId, {
+          x: Math.round(fallbackX),
+          y: Math.round(fallbackY),
+          width: current.width,
+          height: current.height,
+        });
+      }
+      continue;
+    }
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const r of memberRects) {
+      minX = Math.min(minX, r.x);
+      minY = Math.min(minY, r.y);
+      maxX = Math.max(maxX, r.x + r.width);
+      maxY = Math.max(maxY, r.y + r.height);
+    }
+
+    result.set(containerId, {
+      x: Math.round(minX - CONTAINER_PADDING_X),
+      y: Math.round(minY - CONTAINER_PADDING_TOP),
+      width: Math.round(maxX - minX + CONTAINER_PADDING_X * 2),
+      height: Math.round(maxY - minY + CONTAINER_PADDING_TOP + CONTAINER_PADDING_BOTTOM),
+    });
   }
 
   return result;
@@ -484,23 +648,19 @@ export const designAgent = task({
       .catch(() => {});
 
     try {
-      // Single read of the canvas, taken once before generation starts.
-      // This seeds BOTH the prompt context AND the in-memory node/edge
-      // maps the settle pass uses later — the settle pass never reads
-      // storage again after this. That's deliberate: earlier versions
-      // re-read storage via a second getStorageDocument() call *after*
-      // this run's own mutateStorage() writes had already applied, and
-      // relied on that read reflecting all of them. Liveblocks storage
-      // reads aren't guaranteed to reflect a burst of very recent writes
-      // from the same task the instant they're requested back — if even
-      // one just-added node was missing from that second read, the
-      // settle pass would silently lay everything out with no knowledge
-      // that node existed, and could relocate other nodes right on top
-      // of it. Tracking state in memory as we make each write removes
-      // that race entirely: we always know exactly what we wrote,
-      // because we wrote it.
+      // In-memory picture of the canvas, seeded once from a single
+      // pre-generation read and kept in sync with every mutateStorage()
+      // call this run makes as it happens. The settle pass never reads
+      // storage again after this — see the note further down on why a
+      // second read is unsafe to rely on.
       const liveNodes = new Map<string, Rect>();
       const liveEdges = new Map<string, SimpleEdge>();
+      // Node ids that are containers (visual boundary boxes) rather than
+      // regular shapes.
+      const containerNodeIds = new Set<string>();
+      // nodeId -> containerId, for every node (regular or container) that
+      // currently declares container membership.
+      const nodeContainerId = new Map<string, string>();
 
       let canvasContext = "The canvas is currently empty — create a fresh design.";
       try {
@@ -509,7 +669,12 @@ export const designAgent = task({
           | {
               nodes?: Record<
                 string,
-                { position?: { x: number; y: number }; width?: number; height?: number }
+                {
+                  position?: { x: number; y: number };
+                  width?: number;
+                  height?: number;
+                  data?: { isContainer?: boolean; containerId?: string };
+                }
               >;
               edges?: Record<string, { id: string; source: string; target: string }>;
             }
@@ -523,6 +688,8 @@ export const designAgent = task({
             width: nd.width ?? SHAPE_DEFAULTS.rectangle.width,
             height: nd.height ?? SHAPE_DEFAULTS.rectangle.height,
           });
+          if (nd.data?.isContainer) containerNodeIds.add(id);
+          if (nd.data?.containerId) nodeContainerId.set(id, nd.data.containerId);
         }
         for (const edge of Object.values(flow?.edges ?? {})) {
           if (edge?.source && edge?.target) {
@@ -538,7 +705,7 @@ export const designAgent = task({
           )}\nExtend or modify based on the request; only clear if explicitly asked.`;
         }
       } catch {
-        // No storage yet — treat as empty. liveNodes/liveEdges stay empty,
+        // No storage yet — treat as empty. All maps above stay empty,
         // which correctly represents a fresh canvas.
       }
 
@@ -546,9 +713,9 @@ export const designAgent = task({
       let summary = "Design applied to canvas.";
 
       // Tracks WHICH node ids this run touched (added, moved, resized,
-      // relabeled/recolored) — these are the ones the settle pass is
-      // allowed to move. Their positions/sizes live in liveNodes above,
-      // kept in sync with every mutateStorage() call below as it happens.
+      // relabeled/recolored, or had container membership changed) — the
+      // ones the settle pass is allowed to move / use to decide which
+      // containers need refitting.
       const touchedNodeIds = new Set<string>();
 
       const result = await generateText({
@@ -567,20 +734,39 @@ export const designAgent = task({
               continue;
             }
 
-            // Mirror this call's effect onto liveNodes/liveEdges in
-            // lockstep with the actual storage mutation below, so the
-            // settle pass later has an exact, race-free picture.
+            // Mirror this call's effect onto liveNodes/liveEdges (and the
+            // container-tracking maps) in lockstep with the actual
+            // storage mutation below, so the settle pass later has an
+            // exact, race-free picture.
             switch (call.toolName) {
               case "addNode": {
-                const { id, shape, x, y } = call.input as {
+                const { id, shape, x, y, containerId } = call.input as {
                   id: string;
                   shape: NodeShape;
                   x: number;
                   y: number;
+                  containerId?: string;
                 };
                 const size = SHAPE_DEFAULTS[shape] ?? SHAPE_DEFAULTS.rectangle;
                 liveNodes.set(id, { x, y, width: size.width, height: size.height });
                 touchedNodeIds.add(id);
+                if (containerId) nodeContainerId.set(id, containerId);
+                break;
+              }
+              case "addContainer": {
+                const { id } = call.input as { id: string };
+                // Placeholder geometry — phase 2 of the settle pass
+                // overwrites this entirely based on the container's
+                // members (or the "clear of existing content" fallback
+                // if it ends up with none).
+                liveNodes.set(id, {
+                  x: 100,
+                  y: 80,
+                  width: CONTAINER_DEFAULTS.width,
+                  height: CONTAINER_DEFAULTS.height,
+                });
+                touchedNodeIds.add(id);
+                containerNodeIds.add(id);
                 break;
               }
               case "moveNode": {
@@ -607,18 +793,19 @@ export const designAgent = task({
                 break;
               }
               case "updateNodeData": {
-                const { id } = call.input as { id: string };
-                // Label/color/shape only — position and size are
-                // untouched, so liveNodes already has the right rect
-                // (either from the initial read, or from an earlier
-                // addNode/moveNode/resizeNode call this same run).
+                const { id, containerId } = call.input as { id: string; containerId?: string };
+                // Label/shape/color/containerId only — position and size
+                // are untouched, so liveNodes already has the right rect.
                 touchedNodeIds.add(id);
+                if (containerId !== undefined) nodeContainerId.set(id, containerId);
                 break;
               }
               case "deleteNode": {
                 const { id } = call.input as { id: string };
                 liveNodes.delete(id);
                 touchedNodeIds.delete(id);
+                containerNodeIds.delete(id);
+                nodeContainerId.delete(id);
                 break;
               }
               case "addEdge": {
@@ -656,10 +843,12 @@ export const designAgent = task({
         },
       });
 
-      // --- Settle pass: translate this run's group into place, then
-      // guarantee no overlaps. Uses liveNodes/liveEdges built above —
-      // no storage read here, so nothing can be silently out of date. ---
-      if (touchedNodeIds.size > 0) {
+      // --- Settle pass: translate this run's group into place, resolve
+      // collisions, then auto-fit any containers around their members.
+      // Uses liveNodes/liveEdges/containerNodeIds/nodeContainerId built
+      // above — no storage read here, so nothing can be silently out of
+      // date. ---
+      if (touchedNodeIds.size > 0 || containerNodeIds.size > 0) {
         await lb
           .broadcastEvent(payload.roomId, {
             type: "ai-status",
@@ -668,23 +857,29 @@ export const designAgent = task({
           })
           .catch(() => {});
 
-        const allRects = liveNodes;
-        const allEdges = [...liveEdges.values()];
+        const settled = computeSettledLayout(
+          touchedNodeIds,
+          liveNodes,
+          [...liveEdges.values()],
+          containerNodeIds,
+          nodeContainerId
+        );
 
-        if (allRects.size > 0) {
-          const settled = computeSettledLayout(touchedNodeIds, allRects, allEdges);
-
-          if (settled.size > 0) {
-            await lb.mutateStorage(payload.roomId, ({ root }) => {
-              const flow = root.get("flow");
-              if (!flow) return;
-              const nodes = flow.get("nodes");
-              for (const [id, position] of settled) {
-                const n = nodes.get(id) as { set(k: string, v: unknown): void } | undefined;
-                if (n) n.set("position", position);
+        if (settled.size > 0) {
+          await lb.mutateStorage(payload.roomId, ({ root }) => {
+            const flow = root.get("flow");
+            if (!flow) return;
+            const nodes = flow.get("nodes");
+            for (const [id, rect] of settled) {
+              const n = nodes.get(id) as { set(k: string, v: unknown): void } | undefined;
+              if (!n) continue;
+              n.set("position", { x: rect.x, y: rect.y });
+              if (rect.width !== undefined && rect.height !== undefined) {
+                n.set("width", rect.width);
+                n.set("height", rect.height);
               }
-            });
-          }
+            }
+          });
         }
       }
 
@@ -735,13 +930,14 @@ function applyToolCall(
 
   switch (call.toolName) {
     case "addNode": {
-      const { id, label, shape, colorIndex, x, y } = input as {
+      const { id, label, shape, colorIndex, x, y, containerId } = input as {
         id: string;
         label: string;
         shape: NodeShape;
         colorIndex: number;
         x: number;
         y: number;
+        containerId?: string;
       };
       const ci = clampColor(colorIndex);
       const color = NODE_COLORS[ci];
@@ -753,9 +949,44 @@ function applyToolCall(
             id,
             type: "canvasNode",
             position: { x, y },
-            data: { label, color: color.fill, textColor: color.text, shape },
+            data: {
+              label,
+              color: color.fill,
+              textColor: color.text,
+              shape,
+              ...(containerId ? { containerId } : {}),
+            },
             width: size.width,
             height: size.height,
+          },
+          NODE_SYNC_CONFIG
+        ) as unknown as LiveblocksNode<CanvasNode>
+      );
+      break;
+    }
+
+    case "addContainer": {
+      const { id, label, colorIndex } = input as {
+        id: string;
+        label: string;
+        colorIndex: number;
+      };
+      const ci = clampColor(colorIndex);
+      const color = NODE_COLORS[ci];
+      nodes.set(
+        id,
+        LiveObject.from(
+          {
+            id,
+            type: "canvasNode",
+            // Placeholder — the settle pass's auto-fit step (phase 2 of
+            // computeSettledLayout) overwrites both position and size
+            // based on this container's members.
+            position: { x: 100, y: 80 },
+            data: { label, color: color.fill, textColor: color.text, isContainer: true },
+            width: CONTAINER_DEFAULTS.width,
+            height: CONTAINER_DEFAULTS.height,
+            zIndex: CONTAINER_Z_INDEX,
           },
           NODE_SYNC_CONFIG
         ) as unknown as LiveblocksNode<CanvasNode>
@@ -781,11 +1012,12 @@ function applyToolCall(
     }
 
     case "updateNodeData": {
-      const { id, label, shape, colorIndex } = input as {
+      const { id, label, shape, colorIndex, containerId } = input as {
         id: string;
         label?: string;
         shape?: NodeShape;
         colorIndex?: number;
+        containerId?: string;
       };
       const n = nodes.get(id) as LiveNodeLike | undefined;
       if (n) {
@@ -798,6 +1030,7 @@ function applyToolCall(
           data.set("color", NODE_COLORS[ci].fill);
           data.set("textColor", NODE_COLORS[ci].text);
         }
+        if (containerId !== undefined) data.set("containerId", containerId);
       }
       break;
     }

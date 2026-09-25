@@ -23,11 +23,35 @@ const OVERLAP_MARGIN = 24
  * for a single node reacting to a single user action, greedy converges in
  * one pass and stays cheap enough to run on every drag/resize end.
  */
+// `node` here is the raw storage LiveObject for a node — NOT the plain
+// CanvasNode object React Flow hands you elsewhere. Its "data" field is
+// itself a nested LiveObject (the same pattern canvas-node.tsx's own
+// label/color mutations rely on: `.get("data").set("label", ...)`), so
+// reading a field off it means `.get("isContainer")`, not a direct
+// property access — `data.isContainer` on a LiveObject is always
+// `undefined` since LiveObjects don't expose their fields as plain
+// properties. Reading it as a plain object silently made this check
+// always return false, which meant containers were still being treated
+// as solid obstacles: any node dragged near or into one got pushed back
+// out, and the container itself got pushed by anything overlapping it.
+function isContainerNode(node: { get(k: string): unknown }): boolean {
+  const data = node.get("data") as { get(k: string): unknown } | undefined
+  if (!data) return false
+  return Boolean(data.get("isContainer"))
+}
+
 export function useResolveNodeOverlap() {
   return useMutation(({ storage }, nodeId: string) => {
     const nodesMap = storage.get("flow").get("nodes")
     const moved = nodesMap.get(nodeId)
     if (!moved) return
+
+    // Containers are a visual grouping, not an obstacle — a container is
+    // *meant* to overlap the nodes placed inside it, so it never
+    // participates in collision correction in either direction: dragging
+    // or resizing a container should never trigger a push, and other
+    // nodes should never be pushed away by a container either.
+    if (isContainerNode(moved)) return
 
     const pos = moved.get("position") as { x: number; y: number } | undefined
     if (!pos) return
@@ -39,6 +63,7 @@ export function useResolveNodeOverlap() {
 
     for (const [id, other] of nodesMap.entries()) {
       if (id === nodeId) continue
+      if (isContainerNode(other)) continue
 
       const op = other.get("position") as { x: number; y: number } | undefined
       if (!op) continue

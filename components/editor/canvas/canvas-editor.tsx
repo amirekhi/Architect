@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef } from "react"
+import { useCallback, useEffect, useMemo, useRef } from "react"
 import { useMyPresence } from "@liveblocks/react"
 import {
   ReactFlow,
@@ -18,7 +18,7 @@ import type { Connection } from "@xyflow/react"
 import { useLiveblocksFlow } from "@liveblocks/react-flow"
 import { useUndo, useRedo, useCanUndo, useCanRedo } from "@liveblocks/react"
 import type { CanvasNode, CanvasEdge, NodeShape } from "@/types/canvas"
-import { NODE_COLORS } from "@/types/canvas"
+import { NODE_COLORS, CONTAINER_Z_INDEX } from "@/types/canvas"
 import { CanvasNodeComponent } from "@/components/editor/canvas/canvas-node"
 import { CanvasEdgeComponent } from "@/components/editor/canvas/canvas-edge"
 import { ShapePanel } from "@/components/editor/canvas/shape-panel"
@@ -61,6 +61,20 @@ interface CanvasEditorProps {
 export function CanvasEditor({ projectId, pendingTemplate, onTemplateImported, onSaveStatusChange, onSaveReady }: CanvasEditorProps) {
   const { nodes, edges, onNodesChange, onEdgesChange, onDelete } =
     useLiveblocksFlow<CanvasNode, CanvasEdge>({ suspense: true })
+
+  // React Flow stacks nodes in array order — an earlier entry renders
+  // behind a later one, regardless of any `zIndex` field on the node
+  // itself (that field is set on creation as a secondary signal, but
+  // isn't reliable enough on its own to depend on — nothing guarantees
+  // it survives every hop through the Liveblocks sync layer). Sorting
+  // containers to the front here is what actually, unconditionally keeps
+  // them rendered behind every regular shape.
+  const renderNodes = useMemo(() => {
+    const containers = nodes.filter((n) => n.data?.isContainer)
+    if (containers.length === 0) return nodes
+    const others = nodes.filter((n) => !n.data?.isContainer)
+    return [...containers, ...others]
+  }, [nodes])
 
   const reactFlow = useReactFlow()
   const { screenToFlowPosition, zoomIn, zoomOut, fitView } = reactFlow
@@ -215,6 +229,45 @@ export function CanvasEditor({ projectId, pendingTemplate, onTemplateImported, o
     (event: React.DragEvent) => {
       event.preventDefault()
 
+      // Container drop — distinct dataTransfer key from regular shapes
+      // (set in shape-panel.tsx), handled first since a container isn't
+      // a NodeShape and needs its own defaults (larger size, low zIndex
+      // so it renders behind members placed inside it).
+      const containerRaw = event.dataTransfer.getData("application/ghost-container")
+      if (containerRaw) {
+        let payload: { size: { width: number; height: number } }
+        try {
+          payload = JSON.parse(containerRaw)
+        } catch {
+          return
+        }
+
+        const center = screenToFlowPosition({ x: event.clientX, y: event.clientY })
+        const position = {
+          x: center.x - payload.size.width / 2,
+          y: center.y - payload.size.height / 2,
+        }
+
+        const id = generateNodeId("container")
+        const newContainer: CanvasNode = {
+          id,
+          type: "canvasNode",
+          position,
+          data: {
+            label: "",
+            color: NODE_COLORS[0].fill,
+            textColor: NODE_COLORS[0].text,
+            isContainer: true,
+          },
+          width: payload.size.width,
+          height: payload.size.height,
+          zIndex: CONTAINER_Z_INDEX,
+        }
+
+        onNodesChange([{ type: "add", item: newContainer }])
+        return
+      }
+
       const raw = event.dataTransfer.getData("application/ghost-shape")
       if (!raw) return
 
@@ -256,7 +309,7 @@ export function CanvasEditor({ projectId, pendingTemplate, onTemplateImported, o
       onMouseLeave={onMouseLeave}
     >
       <ReactFlow
-        nodes={nodes}
+        nodes={renderNodes}
         edges={edges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}

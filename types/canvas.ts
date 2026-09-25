@@ -31,11 +31,37 @@ export const SHAPE_DEFAULTS: Record<NodeShape, { width: number; height: number }
   hexagon: { width: 140, height: 120 },
 }
 
+// Default size for a freshly-dropped container. Wide/tall enough to
+// immediately hold a handful of regular nodes without the user having to
+// resize it right away.
+export const CONTAINER_DEFAULTS = { width: 420, height: 300 }
+
+// Containers render behind everything else so members placed inside them
+// stay visually on top. Set as the React Flow node's top-level `zIndex`
+// (not a data field) at creation time.
+export const CONTAINER_Z_INDEX = -1
+
 export interface CanvasNodeData extends Record<string, unknown> {
   label: string
   color?: string
   textColor?: string
   shape?: NodeShape
+  // When true, this node renders and behaves as a container (a labeled
+  // boundary box, e.g. "VPC" or "Private Subnet") instead of a regular
+  // shape. Intentionally reuses the same CanvasNode/canvasNode node type
+  // rather than introducing a second React Flow node type — that keeps
+  // every place that already handles CanvasNode[] (autosave, canvas
+  // load/save, spec generation, templates, useNodes<CanvasNode>()) working
+  // unchanged, since a container is still just a CanvasNode with a flag.
+  isContainer?: boolean
+  // For a regular (non-container) node: the id of the container node it
+  // conceptually belongs inside, if any. Purely metadata — nothing in the
+  // client renders based on this field. It exists so Ghost AI can declare
+  // "this node belongs in that boundary box" without needing to compute
+  // the boundary's geometry itself; the design-agent settle pass reads it
+  // to auto-fit each container around its members. A human placing a node
+  // inside a container box by eye never needs to set this.
+  containerId?: string
 }
 
 export interface CanvasEdgeData extends Record<string, unknown> {
